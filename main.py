@@ -5,7 +5,7 @@ import discord
 from discord.ext import commands
 
 from config import TOKEN, PREFIX
-from claude import ask_claude
+from groq import ask_ai
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -69,11 +69,65 @@ async def build(ctx, *, prompt):
         "-# Reading request..."
     )
 
-    response = ask_claude(prompt)
+    response = ask_ai(prompt)
 
-    await status.edit(
-        content=response
+    code_keywords = [
+        "code",
+        "python",
+        "discord",
+        "bot",
+        "script",
+        "program",
+        "function",
+        "class",
+        "command",
+        "main.py",
+        "html",
+        "css",
+        "javascript",
+        "java",
+        "c++",
+        "c#",
+        "cpp",
+        "sql",
+        "php",
+        "lua",
+        "go",
+        "rust"
+    ]
+
+    is_code_request = any(
+        word in prompt.lower()
+        for word in code_keywords
     )
+
+    if is_code_request:
+
+        file = discord.File(
+            io.BytesIO(response.encode()),
+            filename="generated_code.txt"
+        )
+
+        await status.edit(
+            content="Finished.\nYour generated code is attached below.",
+            attachments=[file]
+        )
+
+    elif len(response) < 1500 and response.count("\n") < 40:
+
+        await status.edit(content=response)
+
+    else:
+
+        file = discord.File(
+            io.BytesIO(response.encode()),
+            filename="output.txt"
+        )
+
+        await status.edit(
+            content="Finished.\nThe output was too large, so I've attached it as a file.",
+            attachments=[file]
+        )
 
 
 bot.run(TOKEN)
