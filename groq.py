@@ -25,7 +25,7 @@ def _call_groq(messages: list, max_tokens: int = 500) -> str:
                 "messages": messages,
                 "max_tokens": max_tokens
             },
-            timeout=30
+            timeout=10
         )
 
         if response.status_code != 200:
@@ -42,10 +42,57 @@ def _call_groq(messages: list, max_tokens: int = 500) -> str:
         return "Failed to parse API response"
 
 
+def _parse_filenames(response: str) -> list:
+    """
+    Parse filenames out of a model response.
+
+    Tries strict JSON first, then falls back to reading
+    one filename per line (stripping bullets/numbers/quotes).
+
+    Args:
+        response: Raw model output
+
+    Returns:
+        List of filenames, or empty list if nothing usable was found
+    """
+    # Attempt 1: JSON array
+    try:
+        start = response.find("[")
+        end = response.rfind("]") + 1
+        if start != -1 and end > start:
+            json_str = response[start:end]
+            filenames = json.loads(json_str)
+            if isinstance(filenames, list) and filenames:
+                return [str(f).strip() for f in filenames if str(f).strip()]
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Attempt 2: newline-separated fallback
+    filenames = []
+    for line in response.splitlines():
+        cleaned = line.strip()
+
+        if not cleaned:
+            continue
+
+        # Strip common list prefixes: "-", "*", "1.", "1)", quotes, commas
+        cleaned = cleaned.lstrip("-*0123456789.) ").strip()
+        cleaned = cleaned.strip('",\'')
+
+        # A filename should look like one (has an extension, no spaces)
+        if cleaned and "." in cleaned and " " not in cleaned:
+            filenames.append(cleaned)
+
+    return filenames
+
+
 def plan_project(prompt: str) -> list:
     """
     Generate a list of filenames needed for a project.
-    
+
+    Retries once on empty/failed parse, then falls back to
+    newline parsing before giving up.
+
     Args:
         prompt: User's request for what to build
         
@@ -70,20 +117,65 @@ def plan_project(prompt: str) -> list:
         {"role": "user", "content": prompt}
     ]
 
+    # First attempt
     response = _call_groq(messages, max_tokens=200)
+    filenames = _parse_filenames(response)
 
-    try:
-        # Extract JSON from response (in case there's extra text)
-        start = response.find("[")
-        end = response.rfind("]") + 1
-        if start != -1 and end > start:
-            json_str = response[start:end]
-            filenames = json.loads(json_str)
-            return filenames if isinstance(filenames, list) else []
-    except (json.JSONDecodeError, ValueError):
-        pass
+    if filenames:
+        return filenames
 
-    return []
+    # Retry once (model responses can be flaky)
+    response = _call_groq(messages, max_tokens=200)
+    filenames = _parse_filenames(response)
+
+    return filenames
+
+
+def generate_dev_note(prompt: str, stage: str, context: str = "") -> str:
+    """
+    Generate a short developer-status-style note for the UI.
+
+    This is NOT the model's real reasoning - it's a polished,
+    human-readable status line describing what Yen Max is doing.
+
+    Args:
+        prompt: The user's original request
+        stage: Which stage we're generating a note for
+               ("understanding" or "planning")
+        context: Extra context (e.g. planned filenames) for the note
+
+    Returns:
+        A single short status sentence
+    """
+    system_prompt = """You write short developer-status notes for a coding
+    assistant's UI. These notes describe, in plain past/present tense,
+    a practical observation about the current step - NOT internal reasoning,
+    NOT chain of thought, just a clean one-sentence status update a developer
+    might jot down.
+
+    Rules:
+    - One sentence only
+    - No emojis
+    - No first-person filler like "I think" or "I believe"
+    - State it as a plain observation or decision
+    - Maximum 20 words"""
+
+    if stage == "understanding":
+        user_content = f"User request: {prompt}\n\nWrite one status note about understanding what language/type of project this is."
+    else:
+        user_content = f"User request: {prompt}\n\nPlanned files: {context}\n\nWrite one status note about the project structure."
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content}
+    ]
+
+    note = _call_groq(messages, max_tokens=40)
+
+    if note.startswith("API"):
+        return ""
+
+    return note.strip().strip('"')
 
 
 def generate_file(prompt: str, filename: str) -> str:
@@ -113,7 +205,7 @@ def generate_file(prompt: str, filename: str) -> str:
         {"role": "user", "content": f"Project request: {prompt}\n\nGenerate: {filename}"}
     ]
 
-    return _call_groq(messages, max_tokens=3000)
+    return _call_groq(messages, max_tokens=2000)
 
 
 def ask_general(prompt: str) -> str:
