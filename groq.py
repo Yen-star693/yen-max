@@ -119,22 +119,26 @@ def clean_generated_code(raw: str) -> str:
     text = text.replace("```", "")
 
     # Drop common conversational lead-ins/outros that occasionally slip
-    # through even with "no explanations" in the system prompt
+    # through even with "no explanations" in the system prompt.
+    # Only match at the start of a line to avoid corrupting code like
+    # "certainly = True" or comments like "# Let me explain"
     conversational_prefixes = (
-        "here's", "here is", "sure,", "sure!", "certainly", "of course",
-        "i'll", "i will", "let me",
+        "here's ", "here is ", "sure, ", "sure! ", "certainly ", "of course ",
+        "i'll ", "i will ", "let me ",
     )
     conversational_suffixes = (
-        "let me know", "hope this helps", "feel free to", "would you like",
+        " let me know", " hope this helps", " feel free to", " would you like",
     )
 
     lines = text.splitlines()
 
-    while lines and lines[0].strip().lower().startswith(conversational_prefixes):
+    while lines and any(
+        lines[0].strip().lower().startswith(prefix) for prefix in conversational_prefixes
+    ):
         lines.pop(0)
 
     while lines and any(
-        lines[-1].strip().lower().startswith(s) for s in conversational_suffixes
+        lines[-1].strip().lower().endswith(suffix) for suffix in conversational_suffixes
     ):
         lines.pop()
 
