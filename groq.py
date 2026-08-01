@@ -5,10 +5,13 @@ from config import GROQ_KEY, GROQ_MODEL
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
+# Simple in-memory cache to avoid hammering the API with duplicate requests
+_request_cache = {}
+
 
 def _call_groq(messages: list, max_tokens: int = 500) -> str:
     """
-    Internal helper to call Groq API.
+    Internal helper to call Groq API with request caching.
     
     Args:
         messages: List of message dicts with role and content
@@ -17,6 +20,12 @@ def _call_groq(messages: list, max_tokens: int = 500) -> str:
     Returns:
         API response text or error message
     """
+    # Create a cache key from the messages and max_tokens
+    cache_key = (json.dumps(messages, sort_keys=True), max_tokens)
+    
+    if cache_key in _request_cache:
+        return _request_cache[cache_key]
+    
     try:
         response = requests.post(
             GROQ_API_URL,
@@ -30,17 +39,27 @@ def _call_groq(messages: list, max_tokens: int = 500) -> str:
         )
 
         if response.status_code != 200:
-            return f"API Error: {response.status_code}"
+            error_msg = f"API Error: {response.status_code}"
+            _request_cache[cache_key] = error_msg
+            return error_msg
 
         data = response.json()
-        return data["choices"][0]["message"]["content"]
+        result = data["choices"][0]["message"]["content"]
+        _request_cache[cache_key] = result
+        return result
 
     except requests.Timeout:
-        return "API timeout - took too long"
+        error_msg = "API timeout - took too long"
+        _request_cache[cache_key] = error_msg
+        return error_msg
     except requests.RequestException as e:
-        return f"API error: {str(e)}"
+        error_msg = f"API error: {str(e)}"
+        _request_cache[cache_key] = error_msg
+        return error_msg
     except (KeyError, json.JSONDecodeError):
-        return "Failed to parse API response"
+        error_msg = "Failed to parse API response"
+        _request_cache[cache_key] = error_msg
+        return error_msg
 
 
 def _parse_filenames(response: str) -> list:
@@ -146,84 +165,99 @@ def generate_observations(prompt: str) -> list:
         prompt: The user's build request
 
     Returns:
-        List of 1-3 short observation strings
+        List of 1-2 short observation strings (max 15 words each)
     """
     system_prompt = """You are an experienced software engineer writing
-    terse planning notes before starting a project, the kind you'd jot
-    in a scratch file before writing code.
+    terse planning notes before starting a project.
 
-    Given a user's project request, write 1 to 3 short factual
+    Given a user's project request, write 1 to 2 short factual
     observations about the request itself: whether a language was
     specified (and what default would be used if not), what kind of
-    project it is and what that implies (e.g. a Discord bot implies
-    config/dependency files, a database need implies picking a
-    default database, a website implies templates/static assets,
-    auth implies extra config).
+    project it is.
 
     Rules:
     - Only state things actually implied by the request text
     - Do not invent requirements the user didn't imply
     - No first-person filler ("I think", "I will")
     - No mention of AI, models, prompts, or confidence
-    - Each observation is 1-2 short sentences
-    - Return each observation on its own line, nothing else
-    - Maximum 3 lines"""
+    - Each observation is ONE short sentence
+    - Maximum 15 words per observation
+    - Maximum 2 lines total
+    - Return each observation on its own line, nothing else"""
 
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": f"Request: {prompt}"}
     ]
 
-    response = _call_groq(messages, max_tokens=150)
+    try:
+        response = _call_groq(messages, max_tokens=80)
 
-    if response.startswith("API") or response.startswith("Failed"):
+        if response.startswith("API") or response.startswith("Failed"):
+            return []
+
+        lines = [line.strip().lstrip("-* ").strip() for line in response.splitlines()]
+        return [line for line in lines if line][:2]  # Max 2 observations
+    
+    except Exception as e:
+        print(f"Error generating observations: {e}")
         return []
-
-    lines = [line.strip().lstrip("-* ").strip() for line in response.splitlines()]
-    return [line for line in lines if line]
 
 
 def generate_structure_note(prompt: str, filenames: list) -> str:
     """
-    Generate one observation about the planned file structure,
-    grounded in the actual filenames the planner returned.
+    Generate one short observation about the planned file count.
 
     Args:
         prompt: The user's build request
         filenames: The real list of filenames from plan_project()
 
     Returns:
-        A single short status sentence referencing the real file count
+        A single short status sentence
     """
-    system_prompt = """You are an experienced software engineer. Given a
-    project request and the actual list of files about to be generated,
-    write ONE short sentence describing the structure - e.g. noting the
-    file count, or why a particular file is needed (config, dependency
-    list, templates folder, etc).
+    # Just return a simple one-liner about file count
+    # No need to call the API for this - it's simple enough to generate directly
+    return f"Project structure planned ({len(filenames)} files)."
 
-    Rules:
-    - Reference only the given filenames, do not invent others
-    - No first-person filler
-    - No mention of AI, models, prompts, or confidence
-    - One sentence, maximum 20 words"""
+
+def generate_file_observation(filename: str, content: str) -> str:
+    """
+    Generate a short observation about what's actually in the
+    generated file - e.g. "Defines 3 commands and imports discord.py"
+
+    Args:
+        filename: Name of the file
+        content: The actual generated file content
+
+    Returns:
+        A single short observation about the file, or empty string on error
+    """
+    system_prompt = """You write one short factual line about generated
+    code. Given a filename and its content, describe what it does in
+    ONE short sentence - maximum 15 words.
+
+    Be specific about what's in the code (functions, classes, imports,
+    configuration). No first-person, no filler, no emojis."""
 
     messages = [
         {"role": "system", "content": system_prompt},
         {
             "role": "user",
-            "content": f"Request: {prompt}\nPlanned files: {', '.join(filenames)}"
+            "content": f"File: {filename}\n\nContent:\n{content[:800]}"
         }
     ]
 
-    note = _call_groq(messages, max_tokens=40)
+    try:
+        note = _call_groq(messages, max_tokens=30)
 
-    if note.startswith("API") or note.startswith("Failed"):
-        return f"Project structure planned ({len(filenames)} files)."
+        if note.startswith("API") or note.startswith("Failed"):
+            return ""
 
-    return note.strip().strip('"')
-
-
-def regenerate_file_section(prompt: str, filename: str, broken_code: str, error_message: str, line_number: Optional[int]) -> str:
+        return note.strip().strip('"')
+    
+    except Exception as e:
+        print(f"Error generating file observation: {e}")
+        return ""
     """
     Ask the model to fix a real syntax error that validator.py actually
     found via ast.parse. The error message and line number passed in
@@ -257,7 +291,11 @@ def regenerate_file_section(prompt: str, filename: str, broken_code: str, error_
         }
     ]
 
-    return _call_groq(messages, max_tokens=2000)
+    try:
+        return _call_groq(messages, max_tokens=2000)
+    except Exception as e:
+        print(f"Error regenerating file section: {e}")
+        return broken_code  # return original on error
 
 
 def generate_file(prompt: str, filename: str) -> str:
