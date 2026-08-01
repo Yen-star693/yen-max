@@ -1,42 +1,50 @@
 import discord
 import io
 from typing import List, Tuple
-from groq import plan_project, generate_file, ask_general
+from groq import plan_project, generate_file, ask_general, generate_dev_note
 from analyzer import RequestAnalyzer
+
+# Discord edits are rate-limited; don't hammer the API on every tiny update
+MIN_EDIT_INTERVAL_SECONDS = 0.0  # placeholder if throttling is added later
 
 
 class ProgressTracker:
-    """Tracks and manages progress updates for a build operation."""
+    """
+    Tracks a growing log of Developer Note lines and renders them
+    as Discord subtext (using the "-#" prefix Discord renders as
+    small/dim text).
+
+    Lines are appended, never removed. Earlier lines can be marked
+    complete (swapped from an in-progress phrasing to a completed one).
+    """
+
+    HEADER = "**Developer Note**"
 
     def __init__(self):
-        self.steps = []
-        self.completed = []
+        self.lines: List[str] = []
 
-    def add_step(self, step: str) -> None:
-        """Add a step to track."""
-        self.steps.append(step)
+    def add_line(self, text: str) -> None:
+        """Append a new in-progress status line."""
+        self.lines.append(text)
 
-    def complete_step(self, step_index: int) -> None:
-        """Mark a step as completed."""
-        if step_index < len(self.steps):
-            self.completed.append(self.steps[step_index])
+    def complete_last(self, completed_text: str) -> None:
+        """Replace the most recent line with its completed phrasing."""
+        if self.lines:
+            self.lines[-1] = completed_text
+        else:
+            self.lines.append(completed_text)
 
-    def get_message(self) -> str:
-        """Get formatted progress message."""
-        lines = ["**Developer Note**"]
-        
-        for i, step in enumerate(self.steps):
-            if i < len(self.completed):
-                lines.append(f"✓ {self.completed[i]}")
-            else:
-                lines.append(f"• {step}")
-                break
+    def replace_last(self, text: str) -> None:
+        """Replace the most recent line without marking it complete."""
+        if self.lines:
+            self.lines[-1] = text
+        else:
+            self.lines.append(text)
 
-        return "\n".join(lines)
-
-    def is_complete(self) -> bool:
-        """Check if all steps are done."""
-        return len(self.completed) == len(self.steps)
+    def render(self) -> str:
+        """Render the full Developer Note block as Discord subtext."""
+        body = "\n".join(f"-# {line}" for line in self.lines)
+        return f"{self.HEADER}\n{body}" if body else self.HEADER
 
 
 class ProjectBuilder:
@@ -49,55 +57,79 @@ class ProjectBuilder:
         status_message: discord.Message
     ) -> None:
         """
-        Build a multi-file project with progress tracking.
-        
+        Build a multi-file project, editing status_message continuously
+        with real progress as each stage actually completes.
+
         Args:
             ctx: Discord context
             prompt: User's build request
             status_message: Message to edit with progress
         """
         tracker = ProgressTracker()
-        tracker.add_step("Reading request...")
-        tracker.add_step("Planning project structure...")
-        tracker.add_step("Generating files...")
-        tracker.add_step("Preparing uploads...")
 
-        # Step 1: Read request
-        await status_message.edit(content=tracker.get_message())
-        tracker.complete_step(0)
-        await status_message.edit(content=tracker.get_message())
+        # ---- Reading request ----
+        tracker.add_line("Reading request...")
+        await status_message.edit(content=tracker.render())
 
-        # Step 2: Plan project
+        tracker.complete_last("Reading request.")
+        await status_message.edit(content=tracker.render())
+
+        # ---- Understanding project (dev note) ----
+        tracker.add_line("Understanding project requirements...")
+        await status_message.edit(content=tracker.render())
+
+        understanding_note = generate_dev_note(prompt, stage="understanding")
+        completed_understanding = (
+            understanding_note if understanding_note
+            else "Understood project requirements."
+        )
+        tracker.complete_last(completed_understanding)
+        await status_message.edit(content=tracker.render())
+
+        # ---- Planning project structure ----
+        tracker.add_line("Planning project structure...")
+        await status_message.edit(content=tracker.render())
+
         filenames = plan_project(prompt)
-        
+
         if not filenames:
-            await status_message.edit(
-                content="Failed to plan project structure. Please try again."
-            )
+            tracker.complete_last("Failed to plan project structure.")
+            await status_message.edit(content=tracker.render())
             return
 
-        tracker.complete_step(1)
-        await status_message.edit(content=tracker.get_message())
+        planning_note = generate_dev_note(
+            prompt,
+            stage="planning",
+            context=", ".join(filenames)
+        )
+        completed_planning = (
+            planning_note if planning_note
+            else f"Planned project structure ({len(filenames)} files)."
+        )
+        tracker.complete_last(completed_planning)
+        await status_message.edit(content=tracker.render())
 
-        # Step 3: Generate files
+        # ---- Generate files one at a time, real progress ----
         files = []
-        tracker.steps[2] = f"Generating {len(filenames)} files..."
-        
-        for i, filename in enumerate(filenames):
-            # Update progress
-            tracker.steps[2] = f"Generating files... ({i+1}/{len(filenames)})"
-            await status_message.edit(content=tracker.get_message())
 
-            # Generate file
+        for filename in filenames:
+            tracker.add_line(f"Generating {filename}...")
+            await status_message.edit(content=tracker.render())
+
             content = generate_file(prompt, filename)
 
-            if content and not content.startswith("API"):
+            if content and not content.startswith("API") and not content.startswith("Failed"):
                 files.append((filename, content))
+                tracker.complete_last(f"Generated {filename}.")
+            else:
+                tracker.complete_last(f"Failed to generate {filename}.")
 
-        tracker.complete_step(2)
-        await status_message.edit(content=tracker.get_message())
+            await status_message.edit(content=tracker.render())
 
-        # Step 4: Upload files
+        # ---- Upload ----
+        tracker.add_line("Uploading project...")
+        await status_message.edit(content=tracker.render())
+
         await ProjectBuilder._upload_files(
             ctx,
             status_message,
@@ -113,8 +145,8 @@ class ProjectBuilder:
         files: List[Tuple[str, str]]
     ) -> None:
         """
-        Upload generated files to Discord.
-        
+        Upload generated files to Discord as separate attachments.
+
         Args:
             ctx: Discord context
             status_message: Message to edit
@@ -122,43 +154,32 @@ class ProjectBuilder:
             files: List of (filename, content) tuples
         """
         if not files:
-            await status_message.edit(
-                content="No files were generated. Please try again."
-            )
+            tracker.complete_last("No files were generated.")
+            await status_message.edit(content=tracker.render())
             return
 
         try:
             discord_files = []
 
             for filename, content in files:
-                # Convert to bytes
                 file_bytes = content.encode('utf-8')
-                
-                # Create Discord file object
                 discord_file = discord.File(
                     io.BytesIO(file_bytes),
                     filename=filename
                 )
                 discord_files.append(discord_file)
 
-            tracker.complete_step(3)
-            await status_message.edit(content=tracker.get_message())
-
-            # Send files
             await ctx.send(
                 f"Generated {len(files)} file(s):",
                 files=discord_files
             )
 
-            # Final message
-            await status_message.edit(
-                content=tracker.get_message() + "\n\n✅ Upload complete."
-            )
+            tracker.complete_last("Uploaded project.")
+            await status_message.edit(content=tracker.render())
 
         except Exception as e:
-            await status_message.edit(
-                content=f"Failed to upload files: {str(e)}"
-            )
+            tracker.complete_last(f"Failed to upload files: {str(e)}")
+            await status_message.edit(content=tracker.render())
 
 
 class GeneralResponder:
@@ -199,3 +220,4 @@ class GeneralResponder:
             await ctx.send(file=file)
         else:
             await status_message.edit(content=response)
+
