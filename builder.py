@@ -60,7 +60,14 @@ class ProgressTracker:
             self.add_progress(completed_text)
 
     def render(self) -> str:
-        """Render the full Developer Note with mixed formatting."""
+        """
+        Render the full Developer Note with mixed formatting.
+        
+        Output is capped at ~1900 characters to stay safely under
+        Discord's 2000-character message limit. If we exceed that,
+        we keep the newest lines and drop the oldest progress steps,
+        since those are less relevant than the current state.
+        """
         if not self.lines:
             return self.HEADER
 
@@ -68,7 +75,24 @@ class ProgressTracker:
         for text, is_subtext in self.lines:
             body_lines.append(f"-# {text}" if is_subtext else text)
 
-        return f"{self.HEADER}\n" + "\n".join(body_lines)
+        # Try full render first
+        full = f"{self.HEADER}\n" + "\n".join(body_lines)
+        if len(full) <= 1900:
+            return full
+
+        # Over limit - keep newest lines, drop oldest progress steps
+        # Summaries are always kept (they're at the end and most important)
+        # Drop from the front, working backward until we fit
+        while len(body_lines) > 1:
+            body_lines.pop(0)
+            candidate = f"{self.HEADER}\n" + "\n".join(body_lines)
+            if len(candidate) <= 1900:
+                return candidate
+
+        # Last resort: just return header + most recent line
+        if body_lines:
+            return f"{self.HEADER}\n{body_lines[-1]}"
+        return self.HEADER
 
 
 @dataclass
@@ -140,10 +164,11 @@ class ProjectBuilder:
         tracker.add_progress("Analyzing requirements...")
         await status_message.edit(content=tracker.render())
 
-        observations = generate_observations(prompt)
+        observations = await asyncio.to_thread(generate_observations, prompt)
         tracker.complete_last("Requirements analyzed.")
         for obs in observations:
-            tracker.add_progress(obs)
+            if not obs.startswith("API") and not obs.startswith("Failed"):
+                tracker.add_progress(obs)
         await status_message.edit(content=tracker.render())
 
         # ---- Planning (timed, isolated) ----
@@ -193,7 +218,9 @@ class ProjectBuilder:
             await status_message.edit(content=tracker.render())
             return
 
-        structure_note = generate_structure_note(prompt, filenames)
+        structure_note = await asyncio.to_thread(
+            generate_structure_note, prompt, filenames
+        )
         tracker.complete_last(structure_note)
         await status_message.edit(content=tracker.render())
 
@@ -270,7 +297,9 @@ class ProjectBuilder:
         tracker.complete_last(f"Generated {filename}.")
         await status_message.edit(content=tracker.render())
 
-        file_obs = generate_file_observation(filename, content)
+        file_obs = await asyncio.to_thread(
+            generate_file_observation, filename, content
+        )
         if file_obs:
             tracker.add_progress(file_obs)
             await status_message.edit(content=tracker.render())
@@ -312,7 +341,8 @@ class ProjectBuilder:
             tracker.add_progress(f"Regenerating {filename} (attempt {attempts})...")
             await status_message.edit(content=tracker.render())
 
-            fixed = regenerate_file_section(
+            fixed = await asyncio.to_thread(
+                regenerate_file_section,
                 prompt, filename, current_content, current_error, current_line
             )
 
@@ -375,10 +405,9 @@ class ProjectBuilder:
         try:
             discord_files = []
             for f in generated:
-                label = f.filename if f.passed_validation else f"{f.filename} (needs review)"
                 discord_files.append(discord.File(
                     io.BytesIO(f.content.encode("utf-8")),
-                    filename=f.filename  # actual filename kept clean for download
+                    filename=f.filename
                 ))
 
             await asyncio.wait_for(
