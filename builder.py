@@ -1,7 +1,15 @@
 import discord
 import io
-from typing import List, Tuple
-from groq import plan_project, generate_file, ask_general, generate_dev_note
+from typing import List, Tuple, Optional
+from groq import (
+    plan_project,
+    generate_file,
+    ask_general,
+    generate_observations,
+    generate_structure_note,
+    regenerate_file_section,
+)
+from validator import validate_file, can_validate_syntax, check_unused_imports
 from analyzer import RequestAnalyzer
 
 # Discord edits are rate-limited; don't hammer the API on every tiny update
@@ -74,17 +82,22 @@ class ProjectBuilder:
         tracker.complete_last("Reading request.")
         await status_message.edit(content=tracker.render())
 
-        # ---- Understanding project (dev note) ----
-        tracker.add_line("Understanding project requirements...")
+        # ---- Real observations about the request ----
+        tracker.add_line("Analyzing requirements...")
         await status_message.edit(content=tracker.render())
 
-        understanding_note = generate_dev_note(prompt, stage="understanding")
-        completed_understanding = (
-            understanding_note if understanding_note
-            else "Understood project requirements."
-        )
-        tracker.complete_last(completed_understanding)
-        await status_message.edit(content=tracker.render())
+        observations = generate_observations(prompt)
+
+        if observations:
+            tracker.complete_last("Requirements analyzed.")
+            await status_message.edit(content=tracker.render())
+
+            for obs in observations:
+                tracker.add_line(obs)
+            await status_message.edit(content=tracker.render())
+        else:
+            tracker.complete_last("Requirements analyzed.")
+            await status_message.edit(content=tracker.render())
 
         # ---- Planning project structure ----
         tracker.add_line("Planning project structure...")
@@ -97,37 +110,23 @@ class ProjectBuilder:
             await status_message.edit(content=tracker.render())
             return
 
-        planning_note = generate_dev_note(
-            prompt,
-            stage="planning",
-            context=", ".join(filenames)
-        )
-        completed_planning = (
-            planning_note if planning_note
-            else f"Planned project structure ({len(filenames)} files)."
-        )
-        tracker.complete_last(completed_planning)
+        structure_note = generate_structure_note(prompt, filenames)
+        tracker.complete_last(structure_note)
         await status_message.edit(content=tracker.render())
 
-        # ---- Generate files one at a time, real progress ----
+        # ---- Generate files one at a time, with real validation ----
         files = []
 
         for filename in filenames:
-            tracker.add_line(f"Generating {filename}...")
-            await status_message.edit(content=tracker.render())
+            file_content = await ProjectBuilder._generate_and_validate_file(
+                status_message, tracker, prompt, filename
+            )
 
-            content = generate_file(prompt, filename)
-
-            if content and not content.startswith("API") and not content.startswith("Failed"):
-                files.append((filename, content))
-                tracker.complete_last(f"Generated {filename}.")
-            else:
-                tracker.complete_last(f"Failed to generate {filename}.")
-
-            await status_message.edit(content=tracker.render())
+            if file_content is not None:
+                files.append((filename, file_content))
 
         # ---- Upload ----
-        tracker.add_line("Uploading project...")
+        tracker.add_line("Uploading generated files...")
         await status_message.edit(content=tracker.render())
 
         await ProjectBuilder._upload_files(
@@ -136,6 +135,101 @@ class ProjectBuilder:
             tracker,
             files
         )
+
+    @staticmethod
+    async def _generate_and_validate_file(
+        status_message: discord.Message,
+        tracker: "ProgressTracker",
+        prompt: str,
+        filename: str
+    ) -> Optional[str]:
+        """
+        Generate a single file and, when a real checker exists for its
+        language, actually validate and (once) attempt a real repair.
+
+        Every line printed here corresponds to work that actually ran:
+        - "Checking generated code..." only appears for files we can
+          actually parse (currently Python, via ast.parse)
+        - "Detected a syntax issue..." only appears if ast.parse
+          actually raised a SyntaxError, with the real message/line
+        - Regeneration only happens, and is only reported, if it
+          actually ran
+
+        Args:
+            status_message: Discord message to edit
+            tracker: Shared progress tracker
+            prompt: Original project request
+            filename: File to generate
+
+        Returns:
+            Final file content, or None if generation failed entirely
+        """
+        tracker.add_line(f"Generating {filename}...")
+        await status_message.edit(content=tracker.render())
+
+        content = generate_file(prompt, filename)
+
+        if not content or content.startswith("API") or content.startswith("Failed"):
+            tracker.complete_last(f"Failed to generate {filename}.")
+            await status_message.edit(content=tracker.render())
+            return None
+
+        tracker.complete_last(f"Generated {filename}.")
+        await status_message.edit(content=tracker.render())
+
+        # Only claim to check syntax where a real checker exists
+        if not can_validate_syntax(filename):
+            return content
+
+        tracker.add_line("Checking generated code...")
+        await status_message.edit(content=tracker.render())
+
+        is_valid, error_message, line_number = validate_file(filename, content)
+
+        if is_valid:
+            tracker.complete_last("Code check passed.")
+            await status_message.edit(content=tracker.render())
+
+            unused = check_unused_imports(content)
+            if unused:
+                tracker.add_line(
+                    f"Unused import{'s' if len(unused) != 1 else ''} detected: {', '.join(unused)}."
+                )
+                await status_message.edit(content=tracker.render())
+
+            return content
+
+        # A real syntax error was found - report the real details
+        location = f" around line {line_number}" if line_number else ""
+        tracker.complete_last(f"Detected a syntax issue{location}: {error_message}")
+        await status_message.edit(content=tracker.render())
+
+        tracker.add_line("Regenerating the affected file...")
+        await status_message.edit(content=tracker.render())
+
+        fixed_content = regenerate_file_section(
+            prompt, filename, content, error_message, line_number
+        )
+
+        if not fixed_content or fixed_content.startswith("API"):
+            tracker.complete_last(f"Could not regenerate {filename}.")
+            await status_message.edit(content=tracker.render())
+            return content  # fall back to original rather than losing the file
+
+        # Recheck the regenerated version for real
+        still_valid, recheck_error, recheck_line = validate_file(filename, fixed_content)
+
+        if still_valid:
+            tracker.complete_last("Syntax issue resolved.")
+            await status_message.edit(content=tracker.render())
+            return fixed_content
+
+        # Regeneration didn't actually fix it - say so honestly
+        tracker.complete_last(
+            f"Regeneration did not resolve the issue: {recheck_error}"
+        )
+        await status_message.edit(content=tracker.render())
+        return fixed_content
 
     @staticmethod
     async def _upload_files(
@@ -220,4 +314,3 @@ class GeneralResponder:
             await ctx.send(file=file)
         else:
             await status_message.edit(content=response)
-
