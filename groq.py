@@ -220,6 +220,47 @@ def generate_structure_note(prompt: str, filenames: list) -> str:
     return f"Project structure planned ({len(filenames)} files)."
 
 
+def regenerate_file_section(prompt: str, filename: str, broken_code: str, error_message: str, line_number: Optional[int]) -> str:
+    """
+    Ask the model to fix a real syntax error that validator.py actually
+    found via ast.parse. The error message and line number passed in
+    are real, not simulated.
+
+    Args:
+        prompt: Original project request
+        filename: File being fixed
+        broken_code: The code that failed validation
+        error_message: The real error message from the parser
+        line_number: The real line number of the error, if known
+
+    Returns:
+        Regenerated file content
+    """
+    location = f" near line {line_number}" if line_number else ""
+
+    system_prompt = f"""You are a code generator fixing a real syntax error.
+
+    File: {filename}
+    Syntax error{location}: {error_message}
+
+    Fix ONLY the syntax error. Preserve the original structure and intent.
+    Return ONLY the corrected code, no explanations."""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": f"Project request: {prompt}\n\nBroken code:\n{broken_code}"
+        }
+    ]
+
+    try:
+        return _call_groq(messages, max_tokens=2000)
+    except Exception as e:
+        print(f"Error regenerating file section: {e}")
+        return broken_code  # return original on error
+
+
 def generate_file_observation(filename: str, content: str) -> str:
     """
     Generate a short observation about what's actually in the
