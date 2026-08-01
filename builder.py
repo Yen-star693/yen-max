@@ -8,6 +8,7 @@ from groq import (
     generate_observations,
     generate_structure_note,
     regenerate_file_section,
+    generate_file_observation,
 )
 from validator import validate_file, can_validate_syntax, check_unused_imports
 from analyzer import RequestAnalyzer
@@ -176,6 +177,12 @@ class ProjectBuilder:
 
         tracker.complete_last(f"Generated {filename}.")
         await status_message.edit(content=tracker.render())
+
+        # Add observation about what's in the file
+        file_obs = generate_file_observation(filename, content)
+        if file_obs:
+            tracker.add_line(file_obs)
+            await status_message.edit(content=tracker.render())
 
         # Only claim to check syntax where a real checker exists
         if not can_validate_syntax(filename):
