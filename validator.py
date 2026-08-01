@@ -61,13 +61,26 @@ def can_validate_syntax(filename: str) -> bool:
     Other languages would require running untrusted code or a real
     parser, so we're honest that we skip them rather than faking it.
 
+    Also skip obvious non-code files like .txt, .json, .md, .env, etc.
+
     Args:
         filename: Name of the file
 
     Returns:
         True if validate_file can actually check this file's syntax
     """
-    return get_language(filename) == "python"
+    lang = get_language(filename)
+    
+    # Only validate Python code files
+    if lang != "python":
+        return False
+    
+    # Skip files that are obviously not code even if they end in .py
+    # (unlikely, but better safe)
+    if any(x in filename.lower() for x in ["config", "token", "secret", "env"]):
+        return False
+    
+    return True
 
 
 def validate_file(filename: str, content: str) -> Tuple[bool, Optional[str], Optional[int]]:
