@@ -4,6 +4,7 @@ from flask import Flask
 from threading import Thread
 import os
 import time
+import asyncio
 
 from config import TOKEN, PREFIX, BUILD_COOLDOWN_SECONDS
 from permissions import PermissionManager
@@ -47,10 +48,6 @@ perm_manager = PermissionManager()
 # can't be started while the first is still in progress.
 _last_build_time: dict = {}
 _active_builds: set = set()
-
-# Last successful build's file list per user, so `yen retry <filename>`
-# knows what was actually generated without re-running the planner.
-_last_build_files: dict = {}
 
 
 def _check_cooldown(user_id: int) -> float:
@@ -153,7 +150,7 @@ async def preview(ctx, *, prompt: str):
 
     status = await ctx.send("-# Planning project structure...")
 
-    filenames = plan_project(prompt)
+    filenames = await asyncio.to_thread(plan_project, prompt)
 
     if not filenames:
         await status.edit(content="Failed to plan project structure.")
