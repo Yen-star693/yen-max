@@ -1,6 +1,10 @@
 import discord
 import io
+import time
+import asyncio
 from typing import List, Tuple, Optional
+from dataclasses import dataclass, field
+
 from groq import (
     plan_project,
     generate_file,
@@ -10,50 +14,97 @@ from groq import (
     regenerate_file_section,
     generate_file_observation,
 )
-from validator import validate_file, can_validate_syntax, check_unused_imports
-from analyzer import RequestAnalyzer
-
-# Discord edits are rate-limited; don't hammer the API on every tiny update
-MIN_EDIT_INTERVAL_SECONDS = 0.0  # placeholder if throttling is added later
+from validator import (
+    validate_file,
+    can_validate_syntax,
+    check_unused_imports,
+    validate_filename,
+)
+from config import (
+    MAX_FILES_PER_BUILD,
+    MAX_FILE_BYTES,
+    MAX_TOTAL_BUILD_BYTES,
+    MAX_REGENERATION_ATTEMPTS,
+    TIMEOUT_PLANNING,
+    TIMEOUT_GENERATION,
+    TIMEOUT_UPLOAD,
+)
 
 
 class ProgressTracker:
     """
-    Tracks a growing log of Developer Note lines and renders them
-    as Discord subtext (using the "-#" prefix Discord renders as
-    small/dim text).
-
-    Lines are appended, never removed. Earlier lines can be marked
-    complete (swapped from an in-progress phrasing to a completed one).
+    Tracks a growing log of Developer Note lines with mixed formatting.
+    Subtext (-#) is used for step-by-step progress; regular text is
+    used for summaries and final results, so the message doesn't turn
+    into an unreadable wall of dimmed text.
     """
 
     HEADER = "**Developer Note**"
 
     def __init__(self):
-        self.lines: List[str] = []
+        self.lines: List[Tuple[str, bool]] = []  # (text, is_subtext)
 
-    def add_line(self, text: str) -> None:
-        """Append a new in-progress status line."""
-        self.lines.append(text)
+    def add_progress(self, text: str) -> None:
+        """Add a subtext progress line (shown as -# in Discord)."""
+        self.lines.append((text, True))
+
+    def add_summary(self, text: str) -> None:
+        """Add a regular (non-subtext) summary line."""
+        self.lines.append((text, False))
 
     def complete_last(self, completed_text: str) -> None:
-        """Replace the most recent line with its completed phrasing."""
-        if self.lines:
-            self.lines[-1] = completed_text
+        """Replace the most recent subtext line with its completed phrasing."""
+        if self.lines and self.lines[-1][1]:
+            self.lines[-1] = (completed_text, True)
         else:
-            self.lines.append(completed_text)
-
-    def replace_last(self, text: str) -> None:
-        """Replace the most recent line without marking it complete."""
-        if self.lines:
-            self.lines[-1] = text
-        else:
-            self.lines.append(text)
+            self.add_progress(completed_text)
 
     def render(self) -> str:
-        """Render the full Developer Note block as Discord subtext."""
-        body = "\n".join(f"-# {line}" for line in self.lines)
-        return f"{self.HEADER}\n{body}" if body else self.HEADER
+        """Render the full Developer Note with mixed formatting."""
+        if not self.lines:
+            return self.HEADER
+
+        body_lines = []
+        for text, is_subtext in self.lines:
+            body_lines.append(f"-# {text}" if is_subtext else text)
+
+        return f"{self.HEADER}\n" + "\n".join(body_lines)
+
+
+@dataclass
+class FileResult:
+    """Real outcome of generating + validating a single file."""
+    filename: str
+    content: Optional[str]
+    passed_validation: bool
+    was_checked: bool          # False if no real checker exists for this file type
+    regeneration_attempted: bool = False
+    final_error: Optional[str] = None  # Set only if it still has a real, unresolved error
+
+
+@dataclass
+class BuildResult:
+    """Aggregate result of an entire build, used for the honest summary."""
+    files: List[FileResult] = field(default_factory=list)
+    started_at: float = field(default_factory=time.time)
+    blocked: bool = False
+    block_reason: Optional[str] = None
+
+    @property
+    def passing(self) -> List[FileResult]:
+        return [f for f in self.files if f.content is not None and f.passed_validation]
+
+    @property
+    def failing(self) -> List[FileResult]:
+        return [f for f in self.files if f.content is not None and not f.passed_validation]
+
+    @property
+    def duration_seconds(self) -> float:
+        return round(time.time() - self.started_at, 1)
+
+    @property
+    def any_regeneration_attempted(self) -> bool:
+        return any(f.regeneration_attempted for f in self.files)
 
 
 class ProjectBuilder:
@@ -67,47 +118,78 @@ class ProjectBuilder:
     ) -> None:
         """
         Build a multi-file project, editing status_message continuously
-        with real progress as each stage actually completes.
+        with real progress. Resource limits are checked before any file
+        is generated, and the final upload is gated on real validation
+        results rather than always uploading regardless of outcome.
 
         Args:
             ctx: Discord context
             prompt: User's build request
             status_message: Message to edit with progress
         """
+        result = BuildResult()
         tracker = ProgressTracker()
 
         # ---- Reading request ----
-        tracker.add_line("Reading request...")
+        tracker.add_progress("Reading request...")
         await status_message.edit(content=tracker.render())
-
         tracker.complete_last("Reading request.")
         await status_message.edit(content=tracker.render())
 
-        # ---- Real observations about the request ----
-        tracker.add_line("Analyzing requirements...")
+        # ---- Real observations (grounded in an actual keyword check) ----
+        tracker.add_progress("Analyzing requirements...")
         await status_message.edit(content=tracker.render())
 
         observations = generate_observations(prompt)
-
-        if observations:
-            tracker.complete_last("Requirements analyzed.")
-            await status_message.edit(content=tracker.render())
-
-            for obs in observations:
-                tracker.add_line(obs)
-            await status_message.edit(content=tracker.render())
-        else:
-            tracker.complete_last("Requirements analyzed.")
-            await status_message.edit(content=tracker.render())
-
-        # ---- Planning project structure ----
-        tracker.add_line("Planning project structure...")
+        tracker.complete_last("Requirements analyzed.")
+        for obs in observations:
+            tracker.add_progress(obs)
         await status_message.edit(content=tracker.render())
 
-        filenames = plan_project(prompt)
+        # ---- Planning (timed, isolated) ----
+        tracker.add_progress("Planning project structure...")
+        await status_message.edit(content=tracker.render())
+
+        try:
+            filenames = await asyncio.wait_for(
+                asyncio.to_thread(plan_project, prompt),
+                timeout=TIMEOUT_PLANNING
+            )
+        except asyncio.TimeoutError:
+            tracker.complete_last("Planning timed out.")
+            await status_message.edit(content=tracker.render())
+            return
 
         if not filenames:
             tracker.complete_last("Failed to plan project structure.")
+            await status_message.edit(content=tracker.render())
+            return
+
+        # ---- Resource limits checked BEFORE any generation call ----
+        if len(filenames) > MAX_FILES_PER_BUILD:
+            tracker.complete_last(
+                f"Planned {len(filenames)} files, exceeding the {MAX_FILES_PER_BUILD} file limit."
+            )
+            await status_message.edit(content=tracker.render())
+            tracker.add_summary(
+                f"Build blocked: too many files requested "
+                f"({len(filenames)} > {MAX_FILES_PER_BUILD})."
+            )
+            await status_message.edit(content=tracker.render())
+            return
+
+        # ---- Filename safety checked BEFORE any generation call ----
+        unsafe = []
+        for fname in filenames:
+            is_safe, reason = validate_filename(fname)
+            if not is_safe:
+                unsafe.append((fname, reason))
+
+        if unsafe:
+            tracker.complete_last("One or more planned filenames failed safety checks.")
+            await status_message.edit(content=tracker.render())
+            for fname, reason in unsafe:
+                tracker.add_summary(f"Blocked filename `{fname}`: {reason}.")
             await status_message.edit(content=tracker.render())
             return
 
@@ -115,27 +197,29 @@ class ProjectBuilder:
         tracker.complete_last(structure_note)
         await status_message.edit(content=tracker.render())
 
-        # ---- Generate files one at a time, with real validation ----
-        files = []
+        # ---- Generate + validate each file, tracking real outcomes ----
+        total_bytes = 0
 
         for filename in filenames:
-            file_content = await ProjectBuilder._generate_and_validate_file(
+            file_result = await ProjectBuilder._generate_and_validate_file(
                 status_message, tracker, prompt, filename
             )
+            result.files.append(file_result)
 
-            if file_content is not None:
-                files.append((filename, file_content))
+            if file_result.content:
+                total_bytes += len(file_result.content.encode("utf-8"))
 
-        # ---- Upload ----
-        tracker.add_line("Uploading generated files...")
-        await status_message.edit(content=tracker.render())
+            # Enforce total-size limit as we go, not after the fact
+            if total_bytes > MAX_TOTAL_BUILD_BYTES:
+                tracker.add_summary(
+                    f"Build stopped: total output exceeded "
+                    f"{MAX_TOTAL_BUILD_BYTES // 1000}KB limit."
+                )
+                await status_message.edit(content=tracker.render())
+                break
 
-        await ProjectBuilder._upload_files(
-            ctx,
-            status_message,
-            tracker,
-            files
-        )
+        # ---- Honest readiness summary + upload gating ----
+        await ProjectBuilder._finalize_and_upload(ctx, status_message, tracker, result)
 
     @staticmethod
     async def _generate_and_validate_file(
@@ -143,18 +227,12 @@ class ProjectBuilder:
         tracker: "ProgressTracker",
         prompt: str,
         filename: str
-    ) -> Optional[str]:
+    ) -> FileResult:
         """
         Generate a single file and, when a real checker exists for its
-        language, actually validate and (once) attempt a real repair.
+        language, actually validate and attempt a capped repair.
 
-        Every line printed here corresponds to work that actually ran:
-        - "Checking generated code..." only appears for files we can
-          actually parse (currently Python, via ast.parse)
-        - "Detected a syntax issue..." only appears if ast.parse
-          actually raised a SyntaxError, with the real message/line
-        - Regeneration only happens, and is only reported, if it
-          actually ran
+        Every progress line printed corresponds to work that actually ran.
 
         Args:
             status_message: Discord message to edit
@@ -163,32 +241,44 @@ class ProjectBuilder:
             filename: File to generate
 
         Returns:
-            Final file content, or None if generation failed entirely
+            A FileResult describing exactly what happened
         """
-        tracker.add_line(f"Generating {filename}...")
+        tracker.add_progress(f"Generating {filename}...")
         await status_message.edit(content=tracker.render())
 
-        content = generate_file(prompt, filename)
+        try:
+            content = await asyncio.wait_for(
+                asyncio.to_thread(generate_file, prompt, filename),
+                timeout=TIMEOUT_GENERATION
+            )
+        except asyncio.TimeoutError:
+            tracker.complete_last(f"Generation of {filename} timed out.")
+            await status_message.edit(content=tracker.render())
+            return FileResult(filename, None, False, False, final_error="generation timed out")
 
         if not content or content.startswith("API") or content.startswith("Failed"):
             tracker.complete_last(f"Failed to generate {filename}.")
             await status_message.edit(content=tracker.render())
-            return None
+            return FileResult(filename, None, False, False, final_error=content or "empty response")
+
+        # Enforce per-file size limit
+        if len(content.encode("utf-8")) > MAX_FILE_BYTES:
+            tracker.complete_last(f"{filename} exceeded the size limit and was discarded.")
+            await status_message.edit(content=tracker.render())
+            return FileResult(filename, None, False, False, final_error="exceeded max file size")
 
         tracker.complete_last(f"Generated {filename}.")
         await status_message.edit(content=tracker.render())
 
-        # Add observation about what's in the file
         file_obs = generate_file_observation(filename, content)
         if file_obs:
-            tracker.add_line(file_obs)
+            tracker.add_progress(file_obs)
             await status_message.edit(content=tracker.render())
 
-        # Only claim to check syntax where a real checker exists
         if not can_validate_syntax(filename):
-            return content
+            return FileResult(filename, content, passed_validation=True, was_checked=False)
 
-        tracker.add_line("Checking generated code...")
+        tracker.add_progress("Checking generated code...")
         await status_message.edit(content=tracker.render())
 
         is_valid, error_message, line_number = validate_file(filename, content)
@@ -199,88 +289,129 @@ class ProjectBuilder:
 
             unused = check_unused_imports(content)
             if unused:
-                tracker.add_line(
+                tracker.add_progress(
                     f"Unused import{'s' if len(unused) != 1 else ''} detected: {', '.join(unused)}."
                 )
                 await status_message.edit(content=tracker.render())
 
-            return content
+            return FileResult(filename, content, passed_validation=True, was_checked=True)
 
         # A real syntax error was found - report the real details
         location = f" around line {line_number}" if line_number else ""
         tracker.complete_last(f"Detected a syntax issue{location}: {error_message}")
         await status_message.edit(content=tracker.render())
 
-        tracker.add_line("Regenerating the affected file...")
-        await status_message.edit(content=tracker.render())
+        # Regeneration is capped - only ever attempted MAX_REGENERATION_ATTEMPTS times
+        attempts = 0
+        current_content = content
+        current_error = error_message
+        current_line = line_number
 
-        fixed_content = regenerate_file_section(
-            prompt, filename, content, error_message, line_number
-        )
-
-        if not fixed_content or fixed_content.startswith("API"):
-            tracker.complete_last(f"Could not regenerate {filename}.")
+        while attempts < MAX_REGENERATION_ATTEMPTS:
+            attempts += 1
+            tracker.add_progress(f"Regenerating {filename} (attempt {attempts})...")
             await status_message.edit(content=tracker.render())
-            return content  # fall back to original rather than losing the file
 
-        # Recheck the regenerated version for real
-        still_valid, recheck_error, recheck_line = validate_file(filename, fixed_content)
+            fixed = regenerate_file_section(
+                prompt, filename, current_content, current_error, current_line
+            )
 
-        if still_valid:
-            tracker.complete_last("Syntax issue resolved.")
+            if not fixed or fixed.startswith("API"):
+                tracker.complete_last(f"Could not regenerate {filename}.")
+                await status_message.edit(content=tracker.render())
+                break
+
+            still_valid, recheck_error, recheck_line = validate_file(filename, fixed)
+
+            if still_valid:
+                tracker.complete_last("Syntax issue resolved.")
+                await status_message.edit(content=tracker.render())
+                return FileResult(
+                    filename, fixed, passed_validation=True, was_checked=True,
+                    regeneration_attempted=True
+                )
+
+            current_content, current_error, current_line = fixed, recheck_error, recheck_line
+            tracker.complete_last(f"Regeneration attempt {attempts} did not resolve the issue.")
             await status_message.edit(content=tracker.render())
-            return fixed_content
 
-        # Regeneration didn't actually fix it - say so honestly
-        tracker.complete_last(
-            f"Regeneration did not resolve the issue: {recheck_error}"
+        # Regeneration cap reached (or failed outright) - the file is kept
+        # but honestly marked as still broken, not silently uploaded as-is
+        return FileResult(
+            filename, current_content, passed_validation=False, was_checked=True,
+            regeneration_attempted=(attempts > 0), final_error=current_error
         )
-        await status_message.edit(content=tracker.render())
-        return fixed_content
 
     @staticmethod
-    async def _upload_files(
+    async def _finalize_and_upload(
         ctx,
         status_message: discord.Message,
         tracker: ProgressTracker,
-        files: List[Tuple[str, str]]
+        result: BuildResult
     ) -> None:
         """
-        Upload generated files to Discord as separate attachments.
+        Produce an honest end-of-run summary and only upload files that
+        actually have content. Files with unresolved validation errors
+        are still uploaded (so the user isn't left with nothing) but are
+        clearly labeled, and the summary states exactly how many passed
+        vs. failed - this is never glossed over.
 
         Args:
             ctx: Discord context
             status_message: Message to edit
             tracker: Progress tracker
-            files: List of (filename, content) tuples
+            result: Aggregate build result
         """
-        if not files:
-            tracker.complete_last("No files were generated.")
+        generated = [f for f in result.files if f.content is not None]
+
+        if not generated:
+            tracker.add_summary("No files were generated. Build failed.")
             await status_message.edit(content=tracker.render())
             return
 
+        tracker.add_progress("Uploading generated files...")
+        await status_message.edit(content=tracker.render())
+
         try:
             discord_files = []
+            for f in generated:
+                label = f.filename if f.passed_validation else f"{f.filename} (needs review)"
+                discord_files.append(discord.File(
+                    io.BytesIO(f.content.encode("utf-8")),
+                    filename=f.filename  # actual filename kept clean for download
+                ))
 
-            for filename, content in files:
-                file_bytes = content.encode('utf-8')
-                discord_file = discord.File(
-                    io.BytesIO(file_bytes),
-                    filename=filename
-                )
-                discord_files.append(discord_file)
-
-            await ctx.send(
-                f"Generated {len(files)} file(s):",
-                files=discord_files
+            await asyncio.wait_for(
+                ctx.send(f"Generated {len(discord_files)} file(s):", files=discord_files),
+                timeout=TIMEOUT_UPLOAD
             )
+            tracker.complete_last("Upload complete.")
 
-            tracker.complete_last("Uploaded project.")
+        except asyncio.TimeoutError:
+            tracker.complete_last("Upload timed out.")
             await status_message.edit(content=tracker.render())
-
+            return
         except Exception as e:
-            tracker.complete_last(f"Failed to upload files: {str(e)}")
+            tracker.complete_last(f"Upload failed: {str(e)}")
             await status_message.edit(content=tracker.render())
+            return
+
+        # ---- Honest summary, always shown, never skipped ----
+        passing = result.passing
+        failing = result.failing
+
+        tracker.add_summary("")
+        tracker.add_summary(f"Files generated: {len(generated)}")
+        tracker.add_summary(f"Files passing validation: {len(passing)}")
+        tracker.add_summary(f"Files with errors: {len(failing)}")
+        tracker.add_summary(f"Regeneration attempted: {'yes' if result.any_regeneration_attempted else 'no'}")
+        tracker.add_summary(f"Build time: {result.duration_seconds}s")
+
+        if failing:
+            names = ", ".join(f.filename for f in failing)
+            tracker.add_summary(f"Requires manual correction: {names}")
+
+        await status_message.edit(content=tracker.render())
 
 
 class GeneralResponder:
@@ -294,7 +425,7 @@ class GeneralResponder:
     ) -> None:
         """
         Respond to a general question.
-        
+
         Args:
             ctx: Discord context
             prompt: User's question
@@ -308,9 +439,7 @@ class GeneralResponder:
             await status_message.edit(content="Failed to generate response.")
             return
 
-        # Handle long responses
         if len(response) > MAX_MESSAGE_LENGTH:
-            # Split and send as file
             file = discord.File(
                 io.BytesIO(response.encode('utf-8')),
                 filename="response.txt"
