@@ -1,87 +1,142 @@
 import requests
-
+import json
 from config import GROQ_KEY, GROQ_MODEL
-from prompts import (
-    PROJECT_PLANNER,
-    FILE_GENERATOR,
-    GENERAL_ASSISTANT
-)
 
-URL = "https://api.groq.com/openai/v1/chat/completions"
-
-HEADERS = {
-    "Authorization": f"Bearer {GROQ_KEY}"
-}
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 
-def chat(system_prompt, user_prompt, max_tokens=700):
+def _call_groq(messages: list, max_tokens: int = 500) -> str:
+    """
+    Internal helper to call Groq API.
+    
+    Args:
+        messages: List of message dicts with role and content
+        max_tokens: Maximum tokens in response
+        
+    Returns:
+        API response text or error message
+    """
+    try:
+        response = requests.post(
+            GROQ_API_URL,
+            headers={"Authorization": f"Bearer {GROQ_KEY}"},
+            json={
+                "model": GROQ_MODEL,
+                "messages": messages,
+                "max_tokens": max_tokens
+            },
+            timeout=30
+        )
 
-    r = requests.post(
-        URL,
-        headers=HEADERS,
-        json={
-            "model": GROQ_MODEL,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": system_prompt
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt
-                }
-            ],
-            "max_tokens": max_tokens
-        },
-        timeout=30
-    )
+        if response.status_code != 200:
+            return f"API Error: {response.status_code}"
 
-    r.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
 
-    return r.json()["choices"][0]["message"]["content"].strip()
-
-
-def plan_project(prompt):
-
-    response = chat(
-        PROJECT_PLANNER,
-        prompt,
-        250
-    )
-
-    files = []
-
-    for line in response.splitlines():
-
-        line = line.strip()
-
-        if line:
-            files.append(line)
-
-    return files
+    except requests.Timeout:
+        return "API timeout - took too long"
+    except requests.RequestException as e:
+        return f"API error: {str(e)}"
+    except (KeyError, json.JSONDecodeError):
+        return "Failed to parse API response"
 
 
-def generate_file(prompt, filename):
+def plan_project(prompt: str) -> list:
+    """
+    Generate a list of filenames needed for a project.
+    
+    Args:
+        prompt: User's request for what to build
+        
+    Returns:
+        List of filenames (e.g., ["main.py", "config.py", "README.md"])
+    """
+    system_prompt = """You are a project planning assistant. 
+    
+    Given a user request, return ONLY a JSON list of filenames needed.
 
-    return chat(
-        FILE_GENERATOR,
-        f"""
-Project request:
+    Example input: "make a discord bot"
+    Example output: ["main.py", "commands.py", "config.py", "requirements.txt", "README.md"]
 
-{prompt}
+    Rules:
+    - Return ONLY valid filenames
+    - Include config/readme/requirements files
+    - No explanations or extra text
+    - Return valid JSON array only"""
 
-Generate ONLY this file:
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": prompt}
+    ]
 
-{filename}
-""",
-        1200
-    )
+    response = _call_groq(messages, max_tokens=200)
+
+    try:
+        # Extract JSON from response (in case there's extra text)
+        start = response.find("[")
+        end = response.rfind("]") + 1
+        if start != -1 and end > start:
+            json_str = response[start:end]
+            filenames = json.loads(json_str)
+            return filenames if isinstance(filenames, list) else []
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    return []
 
 
-def ask_general(prompt):
+def generate_file(prompt: str, filename: str) -> str:
+    """
+    Generate code for a specific file.
+    
+    Args:
+        prompt: Original user request
+        filename: Specific file to generate
+        
+    Returns:
+        Generated file content
+    """
+    system_prompt = f"""You are a code generator. 
+    
+    Generate ONLY the code for the file: {filename}
+    
+    Rules:
+    - No explanations
+    - No comments about what you're doing
+    - Just the raw code
+    - Make it production-ready
+    - Handle errors gracefully"""
 
-    return chat(
-        GENERAL_ASSISTANT,
-        prompt,
-        700
-    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"Project request: {prompt}\n\nGenerate: {filename}"}
+    ]
+
+    return _call_groq(messages, max_tokens=3000)
+
+
+def ask_general(prompt: str) -> str:
+    """
+    Answer a general question (non-code).
+    
+    Args:
+        prompt: User's question
+        
+    Returns:
+        Response text
+    """
+    system_prompt = """You are a helpful Discord bot assistant.
+    
+    Keep responses:
+    - Concise
+    - Friendly
+    - Discord-appropriate
+    - Under 2000 characters when possible"""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": prompt}
+    ]
+
+    return _call_groq(messages, max_tokens=500)
