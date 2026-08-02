@@ -13,6 +13,7 @@ from groq import (
     generate_structure_note,
     regenerate_file_section,
     generate_file_observation,
+    generate_check_note,
 )
 from validator import (
     validate_file,
@@ -154,24 +155,16 @@ class ProjectBuilder:
         result = BuildResult()
         tracker = ProgressTracker()
 
-        # ---- Reading request ----
-        tracker.add_progress("Reading request...")
-        await status_message.edit(content=tracker.render())
-        tracker.complete_last("Reading request.")
-        await status_message.edit(content=tracker.render())
-
-        # ---- Real observations (grounded in an actual keyword check) ----
-        tracker.add_progress("Analyzing requirements...")
-        await status_message.edit(content=tracker.render())
-
+        # ---- Casual narration: sizing up the request (normal text) ----
         observations = await asyncio.to_thread(generate_observations, prompt)
-        tracker.complete_last("Requirements analyzed.")
         for obs in observations:
             if not obs.startswith("API") and not obs.startswith("Failed"):
-                tracker.add_progress(obs)
+                tracker.add_summary(obs)
+        if observations:
+            tracker.add_summary("")
         await status_message.edit(content=tracker.render())
 
-        # ---- Planning (timed, isolated) ----
+        # ---- Planning (mechanical step, subtext, timed + isolated) ----
         tracker.add_progress("Planning project structure...")
         await status_message.edit(content=tracker.render())
 
@@ -218,10 +211,15 @@ class ProjectBuilder:
             await status_message.edit(content=tracker.render())
             return
 
+        tracker.complete_last(f"Planned {len(filenames)} files.")
+        await status_message.edit(content=tracker.render())
+
         structure_note = await asyncio.to_thread(
             generate_structure_note, prompt, filenames
         )
-        tracker.complete_last(structure_note)
+        if structure_note and not structure_note.startswith("API"):
+            tracker.add_summary(structure_note)
+            tracker.add_summary("")
         await status_message.edit(content=tracker.render())
 
         # ---- Generate + validate each file, tracking real outcomes ----
@@ -300,8 +298,8 @@ class ProjectBuilder:
         file_obs = await asyncio.to_thread(
             generate_file_observation, filename, content
         )
-        if file_obs:
-            tracker.add_progress(file_obs)
+        if file_obs and not file_obs.startswith("API"):
+            tracker.add_summary(file_obs)
             await status_message.edit(content=tracker.render())
 
         if not can_validate_syntax(filename):
@@ -314,20 +312,31 @@ class ProjectBuilder:
 
         if is_valid:
             tracker.complete_last("Code check passed.")
-            await status_message.edit(content=tracker.render())
+
+            check_note = await asyncio.to_thread(generate_check_note, filename, True)
+            if check_note:
+                tracker.add_summary(check_note)
 
             unused = check_unused_imports(content)
             if unused:
-                tracker.add_progress(
-                    f"Unused import{'s' if len(unused) != 1 else ''} detected: {', '.join(unused)}."
+                tracker.add_summary(
+                    f"Noticed an unused import{'s' if len(unused) != 1 else ''}: "
+                    f"{', '.join(unused)}. Leaving it for now."
                 )
-                await status_message.edit(content=tracker.render())
 
+            tracker.add_summary("")
+            await status_message.edit(content=tracker.render())
             return FileResult(filename, content, passed_validation=True, was_checked=True)
 
         # A real syntax error was found - report the real details
         location = f" around line {line_number}" if line_number else ""
-        tracker.complete_last(f"Detected a syntax issue{location}: {error_message}")
+        tracker.complete_last(f"Syntax issue{location}: {error_message}")
+
+        check_note = await asyncio.to_thread(
+            generate_check_note, filename, False, error_message
+        )
+        if check_note:
+            tracker.add_summary(check_note)
         await status_message.edit(content=tracker.render())
 
         # Regeneration is capped - only ever attempted MAX_REGENERATION_ATTEMPTS times
@@ -354,7 +363,8 @@ class ProjectBuilder:
             still_valid, recheck_error, recheck_line = validate_file(filename, fixed)
 
             if still_valid:
-                tracker.complete_last("Syntax issue resolved.")
+                tracker.complete_last("Rechecked and it's clean now.")
+                tracker.add_summary("")
                 await status_message.edit(content=tracker.render())
                 return FileResult(
                     filename, fixed, passed_validation=True, was_checked=True,
@@ -362,11 +372,12 @@ class ProjectBuilder:
                 )
 
             current_content, current_error, current_line = fixed, recheck_error, recheck_line
-            tracker.complete_last(f"Regeneration attempt {attempts} did not resolve the issue.")
+            tracker.complete_last(f"Attempt {attempts} didn't resolve it.")
             await status_message.edit(content=tracker.render())
 
         # Regeneration cap reached (or failed outright) - the file is kept
         # but honestly marked as still broken, not silently uploaded as-is
+        tracker.add_summary("")
         return FileResult(
             filename, current_content, passed_validation=False, was_checked=True,
             regeneration_attempted=(attempts > 0), final_error=current_error
