@@ -479,6 +479,60 @@ def generate_file_observation(filename: str, content: str) -> str:
     return note.strip().strip('"')
 
 
+def generate_wrapup_thought(filenames: list, all_passed: bool) -> str:
+    """
+    Generate one simulated 'thinking it over' line right before upload,
+    the kind of last look a developer gives a finished project. Grounded
+    in the real filename list and the real pass/fail state - never claims
+    a check ran that didn't.
+
+    Args:
+        filenames: The real list of files that were generated
+        all_passed: Whether every file actually passed validation
+
+    Returns:
+        A single short first-person line
+    """
+    system_prompt = """You are a programmer giving a project one last look
+    before sending it off. Write ONE short first-person line, casual and
+    natural. If everything passed, sound satisfied/ready. If something
+    didn't pass, sound like you're flagging it honestly, not hiding it.
+
+    Rules:
+    - One line only, maximum 20 words
+    - First person, casual tone
+    - No emojis, no "as an AI\""""
+
+    state = "Every file passed its checks." if all_passed else "Not every file passed its checks."
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": f"Files: {', '.join(filenames)}\n{state}"
+        }
+    ]
+
+    try:
+        note = _call_groq(messages, max_tokens=30)
+
+        if note.startswith("API") or note.startswith("Failed"):
+            return (
+                "Everything lines up, ready to send this over."
+                if all_passed else
+                "A couple files still need a look, but here's what I've got."
+            )
+
+        return note.strip().strip('"')
+
+    except Exception:
+        return (
+            "Everything lines up, ready to send this over."
+            if all_passed else
+            "A couple files still need a look, but here's what I've got."
+        )
+
+
 def generate_check_note(filename: str, passed: bool, error_message: str = "") -> str:
     """
     Generate one casual line reacting to a real validation result.
@@ -512,7 +566,7 @@ def generate_check_note(filename: str, passed: bool, error_message: str = "") ->
     ]
 
     try:
-        note = _call_groq(messages, max_tokens=25)
+        note = _call_groq(messages, max_tokens=40)
 
         if note.startswith("API") or note.startswith("Failed"):
             return "That checks out." if passed else "Found something that needs fixing."
@@ -562,7 +616,7 @@ def generate_file(prompt: str, filename: str) -> str:
         {"role": "user", "content": f"Project request: {prompt}\n\nGenerate: {filename}"}
     ]
 
-    result = _call_groq(messages, max_tokens=2000)
+    result = _call_groq(messages, max_tokens=3000)
 
     if result.startswith("API") or result.startswith("Failed"):
         return result  # pass the error through, caller already checks these prefixes
