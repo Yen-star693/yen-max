@@ -14,6 +14,7 @@ from groq import (
     regenerate_file_section,
     generate_file_observation,
     generate_check_note,
+    generate_wrapup_thought,
 )
 from validator import (
     validate_file,
@@ -50,8 +51,22 @@ class ProgressTracker:
         self.lines.append((text, True))
 
     def add_summary(self, text: str) -> None:
-        """Add a regular (non-subtext) summary line."""
+        """Add a regular (non-subtext) summary/result line."""
         self.lines.append((text, False))
+
+    def add_thought(self, text: str) -> None:
+        """
+        Add a simulated 'inner thought' line - fictional UI flavor text
+        written as if Yen is thinking through the task, rendered in
+        italics via Discord's *text* markdown. This is NOT the model's
+        actual reasoning, just narration generated for display.
+
+        Empty/error text is silently skipped so a failed narration call
+        never shows up as an empty *…* line or a raw error string.
+        """
+        if not text or text.startswith("API") or text.startswith("Failed"):
+            return
+        self.lines.append((f"*{text}*", False))
 
     def complete_last(self, completed_text: str) -> None:
         """Replace the most recent subtext line with its completed phrasing."""
@@ -155,11 +170,10 @@ class ProjectBuilder:
         result = BuildResult()
         tracker = ProgressTracker()
 
-        # ---- Casual narration: sizing up the request (normal text) ----
+        # ---- Simulated inner thoughts: sizing up the request (italic) ----
         observations = await asyncio.to_thread(generate_observations, prompt)
         for obs in observations:
-            if not obs.startswith("API") and not obs.startswith("Failed"):
-                tracker.add_summary(obs)
+            tracker.add_thought(obs)
         if observations:
             tracker.add_summary("")
         await status_message.edit(content=tracker.render())
@@ -217,9 +231,8 @@ class ProjectBuilder:
         structure_note = await asyncio.to_thread(
             generate_structure_note, prompt, filenames
         )
-        if structure_note and not structure_note.startswith("API"):
-            tracker.add_summary(structure_note)
-            tracker.add_summary("")
+        tracker.add_thought(structure_note)
+        tracker.add_summary("")
         await status_message.edit(content=tracker.render())
 
         # ---- Generate + validate each file, tracking real outcomes ----
@@ -298,9 +311,8 @@ class ProjectBuilder:
         file_obs = await asyncio.to_thread(
             generate_file_observation, filename, content
         )
-        if file_obs and not file_obs.startswith("API"):
-            tracker.add_summary(file_obs)
-            await status_message.edit(content=tracker.render())
+        tracker.add_thought(file_obs)
+        await status_message.edit(content=tracker.render())
 
         if not can_validate_syntax(filename):
             return FileResult(filename, content, passed_validation=True, was_checked=False)
@@ -314,8 +326,7 @@ class ProjectBuilder:
             tracker.complete_last("Code check passed.")
 
             check_note = await asyncio.to_thread(generate_check_note, filename, True)
-            if check_note:
-                tracker.add_summary(check_note)
+            tracker.add_thought(check_note)
 
             unused = check_unused_imports(content)
             if unused:
@@ -335,8 +346,7 @@ class ProjectBuilder:
         check_note = await asyncio.to_thread(
             generate_check_note, filename, False, error_message
         )
-        if check_note:
-            tracker.add_summary(check_note)
+        tracker.add_thought(check_note)
         await status_message.edit(content=tracker.render())
 
         # Regeneration is capped - only ever attempted MAX_REGENERATION_ATTEMPTS times
@@ -409,6 +419,13 @@ class ProjectBuilder:
             tracker.add_summary("No files were generated. Build failed.")
             await status_message.edit(content=tracker.render())
             return
+
+        all_passed = all(f.passed_validation for f in generated)
+        wrapup = await asyncio.to_thread(
+            generate_wrapup_thought, [f.filename for f in generated], all_passed
+        )
+        tracker.add_thought(wrapup)
+        await status_message.edit(content=tracker.render())
 
         tracker.add_progress("Uploading generated files...")
         await status_message.edit(content=tracker.render())
