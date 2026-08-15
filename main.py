@@ -8,7 +8,6 @@ import asyncio
 
 from config import TOKEN, PREFIX, BUILD_COOLDOWN_SECONDS
 from permissions import PermissionManager
-from analyzer import RequestAnalyzer
 from builder import ProjectBuilder, GeneralResponder
 from groq import plan_project, detect_language_and_framework
 
@@ -144,10 +143,6 @@ async def preview(ctx, *, prompt: str):
         await ctx.send("You don't have permission to use Yen Max.")
         return
 
-    if not RequestAnalyzer.should_use_project_planner(prompt):
-        await ctx.send("This doesn't look like a multi-file project request - nothing to preview.")
-        return
-
     status = await ctx.send("-# Planning project structure...")
 
     filenames = await asyncio.to_thread(plan_project, prompt)
@@ -180,7 +175,8 @@ async def preview(ctx, *, prompt: str):
 @bot.command(name="build")
 async def build(ctx, *, prompt: str):
     """
-    Build a project or generate code.
+    Build a project - always generates files (multi-file project workflow).
+    For a plain question or explanation with no files, use `yen ask` instead.
     
     Usage: yen build <description>
     Examples:
@@ -213,17 +209,11 @@ async def build(ctx, *, prompt: str):
     _last_build_time[ctx.author.id] = time.time()
 
     try:
-        is_project = RequestAnalyzer.should_use_project_planner(prompt)
-
         status_message = await ctx.send(
             "**Developer Note**\n"
             "-# Reading request..."
         )
-
-        if is_project:
-            await ProjectBuilder.build_project(ctx, prompt, status_message)
-        else:
-            await GeneralResponder.respond(ctx, prompt, status_message)
+        await ProjectBuilder.build_project(ctx, prompt, status_message)
 
     except Exception as e:
         await ctx.send(f"An unexpected error occurred: {str(e)}")
@@ -232,6 +222,36 @@ async def build(ctx, *, prompt: str):
     finally:
         # Always release the lock, even if something above raised
         _active_builds.discard(ctx.author.id)
+
+
+@bot.command(name="ask")
+async def ask(ctx, *, prompt: str):
+    """
+    Ask a plain question - no file generation, just a direct answer
+    with a typewriter-style reveal. For generating a project or code
+    files, use `yen build` instead.
+
+    Usage: yen ask <question>
+    Examples:
+        yen ask what's the difference between a list and a tuple in python
+        yen ask explain how async works
+    """
+    guild_id = ctx.guild.id if ctx.guild else None
+
+    if not perm_manager.is_allowed(ctx.author.id, guild_id):
+        await ctx.send(
+            "You don't have permission to use Yen Max.\n"
+            "Ask a server admin to grant you access."
+        )
+        return
+
+    status_message = await ctx.send("-# Thinking...")
+
+    try:
+        await GeneralResponder.respond(ctx, prompt, status_message)
+    except Exception as e:
+        await ctx.send(f"An unexpected error occurred: {str(e)}")
+        print(f"Error in ask command: {e}")
 
 
 # ================= RUN BOT =================
