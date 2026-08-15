@@ -1,7 +1,12 @@
 import discord
 import io
+import os
 import time
 import asyncio
+import tempfile
+import shutil
+import zipfile
+import random
 from typing import List, Tuple, Optional
 from dataclasses import dataclass, field
 
@@ -125,6 +130,7 @@ class FileResult:
 @dataclass
 class BuildResult:
     """Aggregate result of an entire build, used for the honest summary."""
+    build_id: str
     files: List[FileResult] = field(default_factory=list)
     started_at: float = field(default_factory=time.time)
     blocked: bool = False
@@ -167,8 +173,37 @@ class ProjectBuilder:
             prompt: User's build request
             status_message: Message to edit with progress
         """
-        result = BuildResult()
+        build_id = f"{random.randint(10000, 99999)}"
+        result = BuildResult(build_id=build_id)
         tracker = ProgressTracker()
+
+        # Real temp workspace on disk for this build - files are actually
+        # written here as they're generated, and the whole directory is
+        # removed in the finally block regardless of how the build ends.
+        workspace_dir = tempfile.mkdtemp(prefix=f"build_{build_id}_")
+
+        try:
+            await ProjectBuilder._run_build(ctx, prompt, status_message, tracker, result, workspace_dir)
+        finally:
+            shutil.rmtree(workspace_dir, ignore_errors=True)
+
+    @staticmethod
+    async def _run_build(
+        ctx,
+        prompt: str,
+        status_message: discord.Message,
+        tracker: "ProgressTracker",
+        result: "BuildResult",
+        workspace_dir: str
+    ) -> None:
+        """
+        The actual build workflow, separated from build_project so the
+        temp workspace cleanup in the caller reliably runs via `finally`
+        even if something here raises.
+        """
+        tracker.add_progress(f"Build #{result.build_id} starting...")
+        tracker.complete_last(f"Build #{result.build_id} started.")
+        await status_message.edit(content=tracker.render())
 
         # ---- Simulated inner thoughts: sizing up the request (italic) ----
         observations = await asyncio.to_thread(generate_observations, prompt)
@@ -236,6 +271,8 @@ class ProjectBuilder:
         await status_message.edit(content=tracker.render())
 
         # ---- Generate + validate each file, tracking real outcomes ----
+        # Each file is written to the real temp workspace and uploaded
+        # to Discord the moment it's done, rather than all at the end.
         total_bytes = 0
 
         for filename in filenames:
@@ -247,6 +284,17 @@ class ProjectBuilder:
             if file_result.content:
                 total_bytes += len(file_result.content.encode("utf-8"))
 
+                # Write the real file to the real workspace on disk
+                try:
+                    file_path = os.path.join(workspace_dir, filename)
+                    with open(file_path, "w", encoding="utf-8") as f:
+                        f.write(file_result.content)
+                except OSError:
+                    pass  # workspace write is best-effort, upload still happens below
+
+                # Upload this file immediately, right after it's ready
+                await ProjectBuilder._upload_single_file(ctx, file_result)
+
             # Enforce total-size limit as we go, not after the fact
             if total_bytes > MAX_TOTAL_BUILD_BYTES:
                 tracker.add_summary(
@@ -256,8 +304,40 @@ class ProjectBuilder:
                 await status_message.edit(content=tracker.render())
                 break
 
-        # ---- Honest readiness summary + upload gating ----
-        await ProjectBuilder._finalize_and_upload(ctx, status_message, tracker, result)
+        # ---- Honest readiness summary + optional ZIP ----
+        await ProjectBuilder._finalize_build(ctx, status_message, tracker, result, workspace_dir)
+
+    @staticmethod
+    async def _upload_single_file(ctx, file_result: "FileResult") -> None:
+        """
+        Upload one generated file as its own Discord message, immediately
+        after it's ready, rather than batching all files into one message
+        at the very end. Files that still failed validation are labeled
+        in the message text so they're never mistaken for clean output.
+
+        Args:
+            ctx: Discord context
+            file_result: The real result for this specific file
+        """
+        if not file_result.content:
+            return
+
+        try:
+            discord_file = discord.File(
+                io.BytesIO(file_result.content.encode("utf-8")),
+                filename=file_result.filename
+            )
+
+            if file_result.passed_validation:
+                await ctx.send(f"Generated `{file_result.filename}`", file=discord_file)
+            else:
+                await ctx.send(
+                    f"Generated `{file_result.filename}` (needs review - "
+                    f"unresolved syntax issue)",
+                    file=discord_file
+                )
+        except discord.HTTPException:
+            pass  # A failed individual upload doesn't abort the rest of the build
 
     @staticmethod
     async def _generate_and_validate_file(
@@ -295,9 +375,9 @@ class ProjectBuilder:
             return FileResult(filename, None, False, False, final_error="generation timed out")
 
         if not content or content.startswith("API") or content.startswith("Failed"):
-            tracker.complete_last(f"Failed to generate {filename}.")
+            tracker.complete_last(f"Couldn't generate {filename}.")
             await status_message.edit(content=tracker.render())
-            return FileResult(filename, None, False, False, final_error=content or "empty response")
+            return FileResult(filename, None, False, False, final_error="generation failed")
 
         # Enforce per-file size limit
         if len(content.encode("utf-8")) > MAX_FILE_BYTES:
@@ -394,24 +474,28 @@ class ProjectBuilder:
         )
 
     @staticmethod
-    async def _finalize_and_upload(
+    async def _finalize_build(
         ctx,
         status_message: discord.Message,
         tracker: ProgressTracker,
-        result: BuildResult
+        result: BuildResult,
+        workspace_dir: str
     ) -> None:
         """
-        Produce an honest end-of-run summary and only upload files that
-        actually have content. Files with unresolved validation errors
-        are still uploaded (so the user isn't left with nothing) but are
-        clearly labeled, and the summary states exactly how many passed
-        vs. failed - this is never glossed over.
+        Produce an honest end-of-run summary and, if more than one file
+        was generated, bundle the real workspace directory into a ZIP
+        as a convenience alongside the individual files already sent.
+
+        Individual files were already uploaded one-by-one as they were
+        generated (see _upload_single_file), so this only handles the
+        optional ZIP and the final summary text.
 
         Args:
             ctx: Discord context
             status_message: Message to edit
             tracker: Progress tracker
             result: Aggregate build result
+            workspace_dir: Real temp directory holding the generated files
         """
         generated = [f for f in result.files if f.content is not None]
 
@@ -427,41 +511,50 @@ class ProjectBuilder:
         tracker.add_thought(wrapup)
         await status_message.edit(content=tracker.render())
 
-        tracker.add_progress("Uploading generated files...")
-        await status_message.edit(content=tracker.render())
-
-        try:
-            discord_files = []
-            for f in generated:
-                discord_files.append(discord.File(
-                    io.BytesIO(f.content.encode("utf-8")),
-                    filename=f.filename
-                ))
-
-            await asyncio.wait_for(
-                ctx.send(f"Generated {len(discord_files)} file(s):", files=discord_files),
-                timeout=TIMEOUT_UPLOAD
-            )
-            tracker.complete_last("Upload complete.")
-
-        except asyncio.TimeoutError:
-            tracker.complete_last("Upload timed out.")
+        # ---- Optional ZIP of the whole project, only worth it for 2+ files ----
+        if len(generated) > 1:
+            tracker.add_progress("Packaging project as a zip...")
             await status_message.edit(content=tracker.render())
-            return
-        except Exception as e:
-            tracker.complete_last(f"Upload failed: {str(e)}")
+
+            zip_path = os.path.join(workspace_dir, f"build_{result.build_id}.zip")
+            try:
+                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for f in generated:
+                        file_path = os.path.join(workspace_dir, f.filename)
+                        if os.path.exists(file_path):
+                            zf.write(file_path, arcname=f.filename)
+
+                with open(zip_path, "rb") as zf:
+                    zip_bytes = zf.read()
+
+                zip_file = discord.File(
+                    io.BytesIO(zip_bytes),
+                    filename=f"build_{result.build_id}.zip"
+                )
+                await asyncio.wait_for(
+                    ctx.send(f"Full project as a zip:", file=zip_file),
+                    timeout=TIMEOUT_UPLOAD
+                )
+                tracker.complete_last("Zip packaged and sent.")
+
+            except (OSError, asyncio.TimeoutError, discord.HTTPException) as e:
+                tracker.complete_last(f"Couldn't package the zip: {type(e).__name__}.")
+
             await status_message.edit(content=tracker.render())
-            return
 
         # ---- Honest summary, always shown, never skipped ----
         passing = result.passing
         failing = result.failing
 
         tracker.add_summary("")
-        tracker.add_summary(f"Files generated: {len(generated)}")
-        tracker.add_summary(f"Files passing validation: {len(passing)}")
-        tracker.add_summary(f"Files with errors: {len(failing)}")
-        tracker.add_summary(f"Regeneration attempted: {'yes' if result.any_regeneration_attempted else 'no'}")
+        tracker.add_summary(f"Build #{result.build_id}")
+        tracker.add_summary("")
+        tracker.add_summary(f"Files: {len(generated)}")
+        tracker.add_summary(f"Generated: {len(generated)}")
+        regen_count = sum(1 for f in generated if f.regeneration_attempted)
+        tracker.add_summary(f"Regenerated: {regen_count}")
+        tracker.add_summary(f"Passing validation: {len(passing)}")
+        tracker.add_summary(f"With errors: {len(failing)}")
         tracker.add_summary(f"Build time: {result.duration_seconds}s")
 
         if failing:
@@ -472,7 +565,14 @@ class ProjectBuilder:
 
 
 class GeneralResponder:
-    """Handles general (non-project) requests."""
+    """Handles general (non-project) requests, triggered by `yen ask`."""
+
+    # Typewriter tuning
+    _MIN_EDIT_INTERVAL = 0.35      # never edit more often than this, seconds
+    _CHARS_PER_BATCH_MIN = 8
+    _CHARS_PER_BATCH_MAX = 40
+    _MAX_ANIMATION_SECONDS = 8     # if reveal would take longer than this, skip to full text
+    _TARGET_EDITS = 18             # batch size is chosen to land near this many edits
 
     @staticmethod
     async def respond(
@@ -481,29 +581,101 @@ class GeneralResponder:
         status_message: discord.Message
     ) -> None:
         """
-        Respond to a general question.
+        Answer a general question with a buffered typewriter reveal.
+
+        The full response is generated first (one real API call), then
+        revealed via a small, bounded number of batched message edits -
+        never one edit per character. Batch size scales with response
+        length so longer answers don't multiply the edit count, and if
+        the estimated animation time is too long the effect is skipped
+        entirely in favor of showing the final text immediately.
 
         Args:
             ctx: Discord context
             prompt: User's question
-            status_message: Message to edit with response
+            status_message: Message to edit with the response
         """
         from config import MAX_MESSAGE_LENGTH
 
-        response = ask_general(prompt)
+        response = await asyncio.to_thread(ask_general, prompt)
 
-        if not response or response.startswith("API"):
-            await status_message.edit(content="Failed to generate response.")
+        if not response or response.startswith("API") or response.startswith("Failed"):
+            await status_message.edit(content="Couldn't get a response, try again.")
             return
 
         if len(response) > MAX_MESSAGE_LENGTH:
+            # Too long for a single message - no point animating, send as file
             file = discord.File(
                 io.BytesIO(response.encode('utf-8')),
                 filename="response.txt"
             )
-            await status_message.edit(
-                content="Response was too long, sending as file:"
-            )
+            await status_message.edit(content="That answer was long, sending it as a file:")
             await ctx.send(file=file)
-        else:
-            await status_message.edit(content=response)
+            return
+
+        await GeneralResponder._typewriter_reveal(status_message, response)
+
+    @staticmethod
+    async def _typewriter_reveal(status_message: discord.Message, full_text: str) -> None:
+        """
+        Reveal full_text via batched, rate-limit-safe message edits.
+
+        Batch size is scaled so the total edit count stays roughly
+        constant regardless of response length, and a minimum interval
+        between edits prevents hammering Discord. If a 429 is hit, the
+        animation is abandoned in favor of immediately showing the
+        final text - no aggressive retry loop.
+
+        Args:
+            status_message: The message to progressively edit
+            full_text: The complete response to reveal
+        """
+        text_length = len(full_text)
+
+        if text_length == 0:
+            await status_message.edit(content=full_text)
+            return
+
+        # Scale batch size so total edits land near _TARGET_EDITS
+        batch_size = max(
+            GeneralResponder._CHARS_PER_BATCH_MIN,
+            min(
+                GeneralResponder._CHARS_PER_BATCH_MAX,
+                text_length // GeneralResponder._TARGET_EDITS or GeneralResponder._CHARS_PER_BATCH_MIN
+            )
+        )
+
+        estimated_edits = text_length / batch_size
+        estimated_seconds = estimated_edits * GeneralResponder._MIN_EDIT_INTERVAL
+
+        if estimated_seconds > GeneralResponder._MAX_ANIMATION_SECONDS:
+            # Would take too long to animate readably - just show it
+            await status_message.edit(content=full_text)
+            return
+
+        revealed = ""
+        last_edit_time = 0.0
+
+        for i in range(0, text_length, batch_size):
+            revealed = full_text[:i + batch_size]
+
+            elapsed_since_last = time.time() - last_edit_time
+            if elapsed_since_last < GeneralResponder._MIN_EDIT_INTERVAL:
+                await asyncio.sleep(GeneralResponder._MIN_EDIT_INTERVAL - elapsed_since_last)
+
+            try:
+                await status_message.edit(content=revealed)
+                last_edit_time = time.time()
+            except discord.HTTPException as e:
+                if e.status == 429:
+                    # Rate limited - stop animating, don't retry aggressively
+                    break
+                # Any other HTTP issue - also just stop animating gracefully
+                break
+
+        # Always land on the complete, correct text regardless of how
+        # the animation loop above ended
+        try:
+            await status_message.edit(content=full_text)
+        except discord.HTTPException:
+            pass
